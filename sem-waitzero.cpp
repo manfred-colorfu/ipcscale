@@ -17,20 +17,26 @@
 #include <sys/types.h>
 #include <sys/ipc.h>
 #include <sys/sem.h>
+#include <sys/time.h>
+#include <sys/resource.h>
 #include <pthread.h>
 
 #ifdef __sun
 	 #include <sys/pset.h> /* P_PID, processor_bind() */
 #endif
 
-#define VERBOSE
-#undef VERBOSE
+#define VERBOSE_DEBUG	2
+#define	VERBOSE_NORMAL	1
+#define VERBOSE_OFF	0
+
+int g_verbose = 0;
 
 //////////////////////////////////////////////////////////////////////////////
 
 #define DELAY_BUBBLESORT
 
 #ifdef DELAY_LOOP
+#define DELAY_ALGORITHM	"integer divisions"
 
 #define DELAY_LOOPS	20
 
@@ -52,6 +58,8 @@ unsigned long long do_delay(int loops)
 }
 
 #elif defined (DELAY_BUBBLESORT)
+
+#define DELAY_ALGORITHM	"bubblesort"
 
 #define BUF_SIZE	12
 static volatile int g_BUF_SIZE	= BUF_SIZE;
@@ -98,7 +106,12 @@ static enum {
 	STOPPED,
 } volatile g_state = WAITING;
 
-unsigned long long *g_results;
+struct tres {
+	unsigned long long ops;
+	struct rusage ru;
+};
+
+struct tres *g_results;
 int g_svsem_id;
 int g_max_cpus;
 int *g_svsem_nrs;
@@ -118,10 +131,10 @@ int get_cpunr(int cpunr, int interleave)
 	int off = 0;
 	int ret = 0;
 
-#ifdef VERBOSE
-	printf("get_cpunr %p: cpunr %d max_cpu %d interleave %d.\n",
-		(void*)pthread_self(), cpunr, g_max_cpus, interleave);
-#endif
+	if (g_verbose >= VERBOSE_DEBUG) {
+		printf("get_cpunr %p: cpunr %d max_cpu %d interleave %d.\n",
+			(void*)pthread_self(), cpunr, g_max_cpus, interleave);
+	}
 
 	while (cpunr>0) {
 		ret += interleave;
@@ -131,9 +144,10 @@ int get_cpunr(int cpunr, int interleave)
 		}
 		cpunr--;
 	}
-#ifdef VERBOSE
-	printf("get_cpunr %p: result %d.\n", (void*)pthread_self(), ret);
-#endif
+	if (g_verbose >= VERBOSE_DEBUG) {
+		printf("get_cpunr %p: result %d.\n", (void*)pthread_self(), ret);
+	}
+
 	return ret;
 }
 
@@ -183,10 +197,10 @@ void* worker_thread(void *arg)
 	int cpu = get_cpunr(ti->cpubind, ti->interleave);
 
 	bind_cpu(cpu);
-#ifdef VERBOSE
-	printf("thread %d: sysvsem %8d, off %8d bound to cpu %d\n",ti->threadid,
-			ti->svsem_id, ti->svsem_nr,cpu);
-#endif
+	if (g_verbose >= VERBOSE_NORMAL) {
+		printf("thread %d: sysvsem %8d, sema %8d bound to cpu %d\n",ti->threadid,
+				ti->svsem_id, ti->svsem_nr,cpu);
+	}
 	
 	rounds = 0;
 	while(g_state == WAITING) {
@@ -227,7 +241,11 @@ void* worker_thread(void *arg)
 			do_delay(ti->delay);
 		rounds++;
 	}
-	g_results[ti->threadid] = rounds;
+	g_results[ti->threadid].ops = rounds;
+	if (getrusage(RUSAGE_THREAD, &g_results[ti->threadid].ru)) {
+		printf("thread %p: getrusage failed, errno %d.\n",
+			(void*)pthread_self(), errno);
+	}
 
 	pthread_exit(0);
 	return NULL;
@@ -254,7 +272,7 @@ void init_threads(int cpu, int cpus, int delay, int interleave)
 			g_svsem_nrs[i] = i;
 	}
 
-	g_results[cpu] = 0;
+	g_results[cpu].ops = 0;
 
 	ti->svsem_id = g_svsem_id;
 	ti->svsem_nr = g_svsem_nrs[cpu];
@@ -280,7 +298,7 @@ unsigned long long do_psem(int cpus, int timeout, int delay, int interleave)
 
 	g_state = WAITING;
 
-	g_results = (unsigned long long*)malloc(sizeof(unsigned long long)*cpus);
+	g_results = (struct tres *)malloc(sizeof(struct tres)*cpus);
 	g_svsem_nrs = (int*)malloc(sizeof(int)*cpus);
 	g_threads = (pthread_t*)malloc(sizeof(pthread_t)*cpus);
 
@@ -302,16 +320,19 @@ unsigned long long do_psem(int cpus, int timeout, int delay, int interleave)
 	for (i=0;i<cpus;i++)
 		pthread_join(g_threads[i], NULL);
 
-#ifdef VERBOSE
-	printf("Result matrix:\n");
-#endif
+	if (g_verbose >= VERBOSE_NORMAL) {
+		printf("Result matrix:\n");
+	}
 	totals = 0;
 	for (i=0;i<cpus;i++) {
-#ifdef VERBOSE
-		printf("  Thread %3d: %8lld\n",
-				i, g_results[i]);
-#endif
-		totals += g_results[i];
+		if (g_verbose >= VERBOSE_NORMAL) {
+			printf("  Thread %3d: %8lld utime %ld.%06ld systime %ld.%06ld vol cswitch %ld invol cswitch %ld.\n",
+				i, g_results[i].ops,
+				g_results[i].ru.ru_utime.tv_sec, g_results[i].ru.ru_utime.tv_usec,
+				g_results[i].ru.ru_stime.tv_sec, g_results[i].ru.ru_stime.tv_usec,
+				g_results[i].ru.ru_nvcsw, g_results[i].ru.ru_nivcsw);
+		}
+		totals += g_results[i].ops;
 	}
 	printf("Cpus %d, interleave %d delay %d: %lld in %d secs\n",
 			cpus, interleave, delay,
@@ -367,25 +388,56 @@ int main(int argc, char **argv)
 	int *cpus;
 	int fastest;
 	int i, j, k;
+	int opt;
+	int maxdelay;
 
-	printf("sem-waitzero [timeout] <interleave1,interleave2> <cpu1,cpu2>\n");
+	timeout = 5;
+	interleaves = NULL;
+	cpus = NULL;
+	maxdelay = 512;
 
-	if (argc < 2) {
-		printf(" Invalid parameters.\n");
-		printf("\n");
-		printf(" Sem-waitzero performs parallel 'test-for-zero' sysv semaphore operations.\n");
-		printf(" Each thread has it's own semaphore in one large semaphore array.\n");
-		printf(" The semaphores are always 0, i.e. the threads never sleep and no task\n");
-		printf(" switching will occur.\n");
-		printf(" This might be representative for a big-reader style lock.\n");
-		return 1;
+	printf("sem-waitzero <-t timeout, default 5> <-v> <-i interleave1,interleave2> <-c cpu1,cpu2>\n");
+
+	while ((opt = getopt(argc, argv, "m:vt:i:c:")) != -1) {
+		switch(opt) {
+			case 'v':
+				g_verbose++;
+				break;
+			case 'i':
+				interleaves = decode_commastring(optarg);
+				break;
+			case 'c':
+				cpus = decode_commastring(optarg);
+				break;
+			case 't':
+				timeout = atoi(optarg);
+				break;
+			case 'm':
+				maxdelay = atoi(optarg);
+				break;
+			default: /* '?' */
+				printf(" sem-waitzero v0.10, (C) Manfred Spraul 2013\n");
+				printf("\n");
+				printf(" Sem-waitzero performs parallel 'test-for-zero' sysv semaphore operations.\n");
+				printf(" Each thread has it's own semaphore in one large semaphore array.\n");
+				printf(" The semaphores are always 0, i.e. the threads never sleep and no task\n");
+				printf(" switching will occur.\n");
+				printf(" This might be representative for a big-reader style lock. If the performance\n");
+				printf(" goes down when more cores are added then user space operations are performed\n");
+				printf(" until the maximum rate of semaphore operations is observed.\n");
+				printf("\n");
+				printf(" Usage:\n");
+				printf("  -v: Verbose mode. Specify twice for more details\n");
+				printf("  -t x: Test duration, in seconds. Default 5.\n");
+				printf("  -c cpucount1,cpucount2: comma-separated list of cpu counts to use.\n");
+				printf("  -i interleave1,interleave2: comma-separated list of interleaves.\n");
+				printf("  -m: Max amount of user space operations (%s).\n", DELAY_ALGORITHM);
+				return 1;
+		}
 	}
-	timeout = atoi(argv[1]);
-
-	if (argc > 3) {
-		cpus = decode_commastring(argv[3]);
-		i=1;
+	if (cpus) {
 		g_max_cpus = cpus[0];
+		i = 1;
 		while(cpus[i] != 0) {
 			if (cpus[i] > g_max_cpus)
 				g_max_cpus = cpus[i];
@@ -430,9 +482,7 @@ int main(int argc, char **argv)
 		cpus[i] = g_max_cpus;
 		cpus[i+1] = 0;
 	}
-	if (argc > 2) {
-		interleaves = decode_commastring(argv[2]);
-	} else {
+	if (!interleaves) {
 		j=g_max_cpus-1;
 		if (j==0)
 			j = 1;
@@ -451,14 +501,14 @@ int main(int argc, char **argv)
 			interleaves[j] = 1<<j;
 		interleaves[i] = 0;
 	}
-#ifdef VERBOSE
-	for (k = 0; interleaves[k] != 0; k++) {
-		printf("  Interleave %d: %d.\n", k, interleaves[k]);
+	if (g_verbose >= VERBOSE_NORMAL) {
+		for (k = 0; interleaves[k] != 0; k++) {
+			printf("  Interleave %d: %d.\n", k, interleaves[k]);
+		}
+		for (k = 0; cpus[k] != 0; k++) {
+			printf("  Cpu count %d: %d.\n", k, cpus[k]);
+		}
 	}
-	for (k = 0; cpus[k] != 0; k++) {
-		printf("  Cpu count %d: %d.\n", k, cpus[k]);
-	}
-#endif
 	for (k = 0; interleaves[k] != 0; k++) {
 		for (j=0;;) {
 			max_totals = 0;
@@ -475,8 +525,10 @@ int main(int argc, char **argv)
 			}
 			printf("Interleave %d, delay %d: Max total: %lld with %d cpus\n",
 					interleaves[k], j, max_totals, fastest);
-			if (fastest == g_max_cpus)
+
+			if (fastest == g_max_cpus || j >= maxdelay)
 				break;
+
 			/* increase delay in 30% steps */
 			j += j * 0.3 + 1;
 		}
