@@ -114,6 +114,7 @@ struct tres {
 struct tres *g_results;
 int g_svsem_id;
 int g_max_cpus;
+int g_sem_distance = 1;
 int *g_svsem_nrs;
 pthread_t *g_threads;
 
@@ -263,13 +264,15 @@ void init_threads(int cpu, int cpus, int delay, int interleave)
 	}
 	if (cpu == 0) {
 		int i;
-		g_svsem_id = semget(IPC_PRIVATE,cpus,0777|IPC_CREAT);
+		g_svsem_id = semget(IPC_PRIVATE,
+				g_sem_distance*cpus,0777|IPC_CREAT);
 		if(g_svsem_id == -1) {
 			printf("sem array create failed.\n");
 			exit(1);
 		}
 		for (i=0;i<cpus;i++)
-			g_svsem_nrs[i] = i;
+			g_svsem_nrs[i] = g_sem_distance - 1 +
+						g_sem_distance*i;
 	}
 
 	g_results[cpu].ops = 0;
@@ -396,9 +399,9 @@ int main(int argc, char **argv)
 	cpus = NULL;
 	maxdelay = 512;
 
-	printf("sem-waitzero <-t timeout, default 5> <-v> <-i interleave1,interleave2> <-c cpu1,cpu2>\n");
+	printf("sem-waitzero\n");
 
-	while ((opt = getopt(argc, argv, "m:vt:i:c:")) != -1) {
+	while ((opt = getopt(argc, argv, "m:vt:i:c:d:")) != -1) {
 		switch(opt) {
 			case 'v':
 				g_verbose++;
@@ -414,6 +417,9 @@ int main(int argc, char **argv)
 				break;
 			case 'm':
 				maxdelay = atoi(optarg);
+				break;
+			case 'd':
+				g_sem_distance = atoi(optarg);
 				break;
 			default: /* '?' */
 				printf(" sem-waitzero v0.10, (C) Manfred Spraul 2013\n");
@@ -432,6 +438,7 @@ int main(int argc, char **argv)
 				printf("  -c cpucount1,cpucount2: comma-separated list of cpu counts to use.\n");
 				printf("  -i interleave1,interleave2: comma-separated list of interleaves.\n");
 				printf("  -m: Max amount of user space operations (%s).\n", DELAY_ALGORITHM);
+				printf("  -d: Difference between the used semaphores, default 1.\n");
 				return 1;
 		}
 	}
