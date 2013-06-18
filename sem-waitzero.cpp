@@ -393,16 +393,20 @@ int main(int argc, char **argv)
 	int i, j, k;
 	int opt;
 	int maxdelay;
+	int forceall;
 
 	timeout = 5;
 	interleaves = NULL;
 	cpus = NULL;
 	maxdelay = 512;
+	forceall = 0;
 
 	printf("sem-waitzero\n");
 
-	while ((opt = getopt(argc, argv, "m:vt:i:c:d:")) != -1) {
+	while ((opt = getopt(argc, argv, "m:vt:i:c:d:f")) != -1) {
 		switch(opt) {
+			case 'f':
+				forceall = 1;
 			case 'v':
 				g_verbose++;
 				break;
@@ -439,6 +443,7 @@ int main(int argc, char **argv)
 				printf("  -i interleave1,interleave2: comma-separated list of interleaves.\n");
 				printf("  -m: Max amount of user space operations (%s).\n", DELAY_ALGORITHM);
 				printf("  -d: Difference between the used semaphores, default 1.\n");
+				printf("  -f: Force to evaluate all cpu values.\n");
 				return 1;
 		}
 	}
@@ -526,7 +531,7 @@ int main(int argc, char **argv)
 					max_totals = totals;
 					fastest = cpus[i];
 				} else {
-					if (totals < 0.5*max_totals && cpus[i] > 1.5*fastest)
+					if (totals < 0.5*max_totals && cpus[i] > (2+1.5*fastest) && forceall == 0)
 						break;
 				}
 			}
