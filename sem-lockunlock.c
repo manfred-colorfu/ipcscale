@@ -19,6 +19,8 @@
 #include <signal.h>
 #include <unistd.h>
 
+#define SEM_LOCKUNLOCK_VERSION	"0.01"
+
 #define TRUE	1
 #define FALSE	0
 
@@ -91,12 +93,18 @@ int main(int argc,char** argv)
 	union semun arg;
 	int i;
 
-	printf("sem-lockunlock <sems> <tasks> <loops> <busy-in> <busy-out>\n");
+	printf(
+	    "sem-lockunlock %s <sems> <tasks> <loops> <busy-in> <busy-out>\n",
+	    SEM_LOCKUNLOCK_VERSION);
 	if(argc != 6) {
 		printf("Invalid parameters.\n");
 		printf("\n");
 		printf(" Sem-lockunlock create threads that perform lock/unlock with multiple sysv semaphores\n");
-		printf(" int one semaphore array. No cpu binding is performed.\n");
+		printf(" in one semaphore array.\n");
+		printf(" It is not guaranteed that each lock/unlock cycle causes\n");
+		printf(" a reschedule.\n");
+		printf(" No cpu binding is performed.\n");
+		printf(" \n");
 		return 1;
 	}
 	nsems=atoi(argv[1]);

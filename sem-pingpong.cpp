@@ -19,6 +19,8 @@
 #include <sys/sem.h>
 #include <pthread.h>
 
+#define SEM_PINGPONG_VERSION	"0.01"
+
 #ifdef __sun
 	 #include <sys/pset.h> /* P_PID, processor_bind() */
 #endif
@@ -293,7 +295,8 @@ int main(int argc, char **argv)
 	int timeout;
 	int i;
 
-	printf("sem-pingpong [max cpus] [timeout]\n");
+	printf("sem-pingpong %s [max cpus] [timeout]\n",
+			SEM_PINGPONG_VERSION);
 	if (argc != 3) {
 		printf(" Invalid parameters.\n");
 		printf("\n");

@@ -21,6 +21,8 @@
 #include <sys/resource.h>
 #include <pthread.h>
 
+#define SEM_WAITZERO_VERSION	"0.11"
+
 #ifdef __sun
 	 #include <sys/pset.h> /* P_PID, processor_bind() */
 #endif
@@ -426,7 +428,7 @@ int main(int argc, char **argv)
 				g_sem_distance = atoi(optarg);
 				break;
 			default: /* '?' */
-				printf(" sem-waitzero v0.10, (C) Manfred Spraul 2013\n");
+				printf(" sem-waitzero %s, (C) Manfred Spraul 1999-2013\n", SEM_WAITZERO_VERSION);
 				printf("\n");
 				printf(" Sem-waitzero performs parallel 'test-for-zero' sysv semaphore operations.\n");
 				printf(" Each thread has it's own semaphore in one large semaphore array.\n");
