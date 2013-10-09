@@ -388,7 +388,9 @@ int *decode_commastring(const char *str)
 int main(int argc, char **argv)
 {
 	int timeout;
-	unsigned long long totals, max_totals;
+	unsigned long long totals; // Sum of loops over all cpus
+	unsigned long long max_totals; // Max total regardless of cpu count
+	unsigned long long max_abs; // Max, regardless of delay & cpu count
 	int *interleaves;
 	int *cpus;
 	int fastest;
@@ -524,6 +526,7 @@ int main(int argc, char **argv)
 		}
 	}
 	for (k = 0; interleaves[k] != 0; k++) {
+		max_abs = 0;
 		for (j=0;;) {
 			max_totals = 0;
 			fastest = 0;
@@ -540,7 +543,14 @@ int main(int argc, char **argv)
 			printf("Interleave %d, delay %d: Max total: %lld with %d cpus\n",
 					interleaves[k], j, max_totals, fastest);
 
-			if (fastest == g_max_cpus || j >= maxdelay)
+			if (max_abs < max_totals)
+				max_abs = max_totals;
+
+			if (fastest == g_max_cpus)
+				break;
+			if (j >= maxdelay)
+				break;
+			if (max_totals < 0.1*max_abs)
 				break;
 
 			/* increase delay in 30% steps */
