@@ -411,6 +411,7 @@ int main(int argc, char **argv)
 		switch(opt) {
 			case 'f':
 				forceall = 1;
+				break;
 			case 'v':
 				g_verbose++;
 				break;
