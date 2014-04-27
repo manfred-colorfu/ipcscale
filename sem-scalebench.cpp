@@ -48,6 +48,13 @@ int g_verbose = 0;
 
 //////////////////////////////////////////////////////////////////////////////
 
+static inline int units_roundedup(int value, int unit)
+{
+	return (value+unit-1)/unit;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
 #define DELAY_BUBBLESORT
 
 #ifdef DELAY_LOOP
@@ -286,23 +293,23 @@ unsigned long long ping_pong(struct taskinfo *ti)
 int g_operation = WAIT_FOR_ZERO;
 
 
-int get_cpunr(int cpunr, int interleave)
+int get_cpunr(int threadnr, int interleave)
 {
 	int off = 0;
 	int ret = 0;
 
 	if (g_verbose >= VERBOSE_DEBUG) {
-		printf("get_cpunr %p: cpunr %d max_cpu %d interleave %d threadspercore %d.\n",
-			(void*)pthread_self(), cpunr, g_max_cpus, interleave, g_threadspercore);
+		printf("get_cpunr %p: threadnr %d max_cpu %d interleave %d threadspercore %d.\n",
+			(void*)pthread_self(), threadnr, g_max_cpus, interleave, g_threadspercore);
 	}
 
-	while (cpunr > g_threadspercore - 1) {
+	while (threadnr > g_threadspercore - 1) {
 		ret += interleave;
 		if (ret >=g_max_cpus) {
 			off++;
 			ret = off;
 		}
-		cpunr -= g_threadspercore;
+		threadnr -= g_threadspercore;
 	}
 	if (g_verbose >= VERBOSE_DEBUG) {
 		printf("get_cpunr %p: result %d.\n", (void*)pthread_self(), ret);
@@ -389,7 +396,7 @@ void* worker_thread(void *arg)
 	return NULL;
 }
 
-void init_threads(int cpu, int cpus, int delay, int interleave)
+void init_threads(int thread, int threads, int delay, int interleave)
 {
 	int ret;
 	struct taskinfo *ti;
@@ -399,22 +406,22 @@ void init_threads(int cpu, int cpus, int delay, int interleave)
 		printf("Could not allocate task info\n");
 		exit(1);
 	}
-	if (cpu == 0) {
+	if (thread == 0) {
 		int i;
 		g_svsem_id = semget(IPC_PRIVATE,
-				g_sem_distance*cpus,0777|IPC_CREAT);
+				g_sem_distance*threads,0777|IPC_CREAT);
 		if(g_svsem_id == -1) {
 			printf("sem array create failed.\n");
 			exit(1);
 		}
-		for (i=0;i<cpus;i++)
+		for (i=0;i<threads;i++)
 			g_svsem_nrs[i] = g_sem_distance - 1 +
 						g_sem_distance*i;
 	}
 
-	g_results[cpu].ops = 0;
+	g_results[thread].ops = 0;
 
-	ti->threadid = cpu;
+	ti->threadid = thread;
 	ti->interleave = interleave;
 	ti->delay = delay;
 
@@ -427,7 +434,7 @@ void init_threads(int cpu, int cpus, int delay, int interleave)
 
 //////////////////////////////////////////////////////////////////////////////
 
-unsigned long long do_psem(int cpus, int timeout, int delay, int interleave)
+unsigned long long do_psem(int threads, int timeout, int delay, int interleave)
 {
 	unsigned long long totals;
 	int i;
@@ -435,12 +442,12 @@ unsigned long long do_psem(int cpus, int timeout, int delay, int interleave)
 
 	g_state = WAITING;
 
-	g_results = (struct tres *)malloc(sizeof(struct tres)*cpus);
-	g_svsem_nrs = (int*)malloc(sizeof(int)*cpus);
-	g_threads = (pthread_t*)malloc(sizeof(pthread_t)*cpus);
+	g_results = (struct tres *)malloc(sizeof(struct tres)*threads);
+	g_svsem_nrs = (int*)malloc(sizeof(int)*threads);
+	g_threads = (pthread_t*)malloc(sizeof(pthread_t)*threads);
 
-	for (i=0;i<cpus;i++)
-		init_threads(i, cpus, delay, interleave);
+	for (i=0;i<threads;i++)
+		init_threads(i, threads, delay, interleave);
 
 	usleep(DELAY_10MS);
 	g_state = RUNNING;
@@ -454,14 +461,14 @@ unsigned long long do_psem(int cpus, int timeout, int delay, int interleave)
 			g_svsem_id, errno);
 	}
 
-	for (i=0;i<cpus;i++)
+	for (i=0;i<threads;i++)
 		pthread_join(g_threads[i], NULL);
 
 	if (g_verbose >= VERBOSE_NORMAL) {
 		printf("Result matrix:\n");
 	}
 	totals = 0;
-	for (i=0;i<cpus;i++) {
+	for (i=0;i<threads;i++) {
 		if (g_verbose >= VERBOSE_NORMAL) {
 			printf("  Thread %3d: %8lld utime %ld.%06ld systime %ld.%06ld vol cswitch %ld invol cswitch %ld tot %ld.\n",
 				i, g_results[i].ops,
@@ -473,7 +480,7 @@ unsigned long long do_psem(int cpus, int timeout, int delay, int interleave)
 		totals += g_results[i].ops;
 	}
 	printf("Cpus %d, interleave %d threadspercore %d delay %d: %lld in %d secs\n",
-			cpus, interleave, g_threadspercore, delay,
+			threads, interleave, g_threadspercore, delay,
 			totals, timeout);
 
 	free(g_results);
@@ -521,11 +528,11 @@ int *decode_commastring(const char *str)
 int main(int argc, char **argv)
 {
 	int timeout;
-	unsigned long long totals; // Sum of loops over all cpus
-	unsigned long long max_totals; // Max total regardless of cpu count
-	unsigned long long max_abs; // Max, regardless of delay & cpu count
-	int *interleaves;
-	int *cpus;
+	unsigned long long totals;	// Sum of loops over all threads
+	unsigned long long max_totals;	// Max total regardless of thread count
+	unsigned long long max_abs;	// Max, regardless of delay & thread count
+	int *threads;			// 0-terminated array with the thread counts
+	int *interleaves;		// 0-terminated array with the interleaves
 	int fastest;
 	int i, j, k;
 	int opt;
@@ -534,13 +541,13 @@ int main(int argc, char **argv)
 
 	timeout = 5;
 	interleaves = NULL;
-	cpus = NULL;
+	threads = NULL;
 	maxdelay = 512;
 	forceall = 0;
 
 	printf("sem-scalebench\n");
 
-	while ((opt = getopt(argc, argv, "m:vt:i:c:d:p:o:f")) != -1) {
+	while ((opt = getopt(argc, argv, "m:vt:i:c:d:p:o:h:f")) != -1) {
 		switch(opt) {
 			case 'f':
 				forceall = 1;
@@ -559,7 +566,7 @@ int main(int argc, char **argv)
 				}
 				break;
 			case 'c':
-				cpus = decode_commastring(optarg);
+				threads = decode_commastring(optarg);
 				break;
 			case 't':
 				timeout = atoi(optarg);
@@ -577,8 +584,15 @@ int main(int argc, char **argv)
 				break;
 			case 'd':
 				g_sem_distance = atoi(optarg);
-				if (g_sem_distance < 0) {
+				if (g_sem_distance <= 0) {
 					printf(" Invalid semaphore distance specified.\n");
+					return 1;
+				}
+				break;
+			case 'h':
+				g_max_cpus = atoi(optarg);
+				if (g_max_cpus <= 0) {
+					printf(" Invalid number of threads per core specified.\n");
 					return 1;
 				}
 				break;
@@ -608,29 +622,24 @@ int main(int argc, char **argv)
 				printf(" 2) Ping-Pong:\n");
 				printf("    Pairs of threads pass a token to each other. Each token passing forces\n");
 				printf("    a task switch.\n");
+				printf(" First up to <threads per core> threads are put on core 0, then the next thread(s)\n");
+				printf(" are placed to the core <interleave>.\n");
 				printf("\n");
 				printf(" Usage:\n");
 				printf("  -v: Verbose mode. Specify twice for more details\n");
 				printf("  -t x: Test duration, in seconds. Default 5.\n");
-				printf("  -c cpucount1,cpucount2: comma-separated list of cpu counts to use.\n");
-				printf("  -i interleave1,interleave2: comma-separated list of interleaves.\n");
+				printf("  -c threadcount1,threadcount2: comma-separated list of thread counts to use.\n");
 				printf("  -p threads per core: Number of threads that should run on one core.\n");
+				printf("  -i interleave1,interleave2: comma-separated list of interleaves.\n");
+				printf("  -h highest core number that should be used.\n");
 				printf("  -m: Max amount of user space operations (%s).\n", DELAY_ALGORITHM);
 				printf("  -d: Difference between the used semaphores, default 1.\n");
 				printf("  -o 1/2: Operation, either 1 (wait-for-zero) or 2 (ping-pong). Default 1.\n");
-				printf("  -f: Force to evaluate all cpu values.\n");
+				printf("  -f: Force to evaluate all thread values.\n");
 				return 1;
 		}
 	}
-	if (cpus) {
-		g_max_cpus = cpus[0];
-		i = 1;
-		while(cpus[i] != 0) {
-			if (cpus[i] > g_max_cpus)
-				g_max_cpus = cpus[i];
-			i++;
-		}
-	} else {
+	if (!threads) {
 		cpu_set_t cpuset;
 		int ret;
 
@@ -654,20 +663,56 @@ int main(int argc, char **argv)
 			i++;
 		}
 		i = i + 2;
-		cpus = (int*)malloc(sizeof(int)*(i+2));
-		if (!cpus) {
-			printf("Could not allocate memory for decoding parameters.\n");
+		threads = (int*)malloc(sizeof(int)*(i+2));
+		if (!threads) {
+			printf("Could not allocate memory for thread counts.\n");
 			exit(1);
 		}
 		j = 1;
 		i = 0;
 		while (j < g_max_cpus) {
-			cpus[i] = j;
+			threads[i] = j*g_threadspercore;
 			j+=j*0.2+1;
 			i++;
 		}
-		cpus[i] = g_max_cpus;
-		cpus[i+1] = 0;
+		threads[i] = g_max_cpus*g_threadspercore;
+		threads[i+1] = 0;
+	}
+	switch (g_operation) {
+		case PING_PONG:
+			/* ping-pong supports only even cpu numbers */
+			i=0;
+			while (threads[i] != 0) {
+				/* task 1: round down, but never to 0 */
+				threads[i] = (threads[i]/2)*2;
+				if (threads[i] == 0)
+					threads[i] = 2;
+
+				/* task 2: remove duplicates */
+				if (i > 0 && threads[i-1] == threads[i]) {
+					j=i;
+					while(threads[j] != 0) {
+						threads[j] = threads[j+1];
+						j++;
+					}
+				} else {
+					i++;
+				}
+			}
+			break;
+		default:
+			break;
+	}
+	if (g_max_cpus == 0) {
+		g_max_cpus = units_roundedup(threads[0], g_threadspercore);
+		i = 1;
+		while(threads[i] != 0) {
+			int nv;
+			nv = units_roundedup(threads[i], g_threadspercore);
+			if (nv > g_max_cpus)
+				g_max_cpus = nv;
+			i++;
+		}
 	}
 	if (!interleaves) {
 		j=g_max_cpus-1;
@@ -692,9 +737,10 @@ int main(int argc, char **argv)
 		for (k = 0; interleaves[k] != 0; k++) {
 			printf("  Interleave %d: %d.\n", k, interleaves[k]);
 		}
-		for (k = 0; cpus[k] != 0; k++) {
-			printf("  Cpu count %d: %d.\n", k, cpus[k]);
+		for (k = 0; threads[k] != 0; k++) {
+			printf("  Thread count %d: %d.\n", k, threads[k]);
 		}
+		printf("  g_max_cpus: %d.\n", g_max_cpus);
 	}
 	if (g_operation == WAIT_FOR_ZERO)
 		printf("Performing WAIT_FOR_ZERO operations.\n");
@@ -706,30 +752,21 @@ int main(int argc, char **argv)
 		for (j=0;;) {
 			max_totals = 0;
 			fastest = 0;
-			for (i=0; cpus[i] != 0; i++) {
+			for (i=0; threads[i] != 0; i++) {
 				int cur_cpus;
-				
-				/*
-				 * PING_PONG is impossible with just 1 cpu and
-				 * needs an even thread count.
-				 */
-				cur_cpus = cpus[i];
-				if (g_operation == PING_PONG && cur_cpus == 1) {
-					totals = 0;
-				} else {
-					if (g_operation == PING_PONG && cur_cpus%2 != 0)
-						cur_cpus--;	
-					totals = do_psem(cur_cpus, timeout, j, interleaves[k]);
-				}
+
+				cur_cpus = threads[i];
+				totals = do_psem(cur_cpus, timeout, j, interleaves[k]);
+
 				if (totals > max_totals) {
 					max_totals = totals;
 					fastest = cur_cpus;
 				} else {
-					if (totals < 0.5*max_totals && cpus[i] > (2+1.5*fastest) && forceall == 0)
+					if (totals < 0.5*max_totals && threads[i] > (2+1.5*fastest) && forceall == 0)
 						break;
 				}
 			}
-			printf("Interleave %d, delay %d: Max total: %lld with %d cpus\n",
+			printf("Interleave %d, delay %d: Max total: %lld with %d threads\n",
 					interleaves[k], j, max_totals, fastest);
 
 			if (max_abs < max_totals)
