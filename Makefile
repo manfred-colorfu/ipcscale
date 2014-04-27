@@ -1,4 +1,4 @@
-OUT_FILES=sem-waitzero sem-pingpong sem-lockunlock
+OUT_FILES=sem-scalebench sem-lockunlock
 
 CFLAGS = -Wall -g -O2 -pthread
 LFLAGS = -static

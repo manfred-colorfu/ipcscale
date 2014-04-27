@@ -1,11 +1,24 @@
 /*
- * sem-waitzero.cpp - sysv scaling test
+ * sem-scalebench.cpp - sysv scaling test
  *
 * Copyright (C) 1999, 2001, 2005, 2008, 2013 by Manfred Spraul.
  *	All rights reserved except the rights granted by the GPL.
  *
  * Redistribution of this file is permitted under the terms of the GNU 
  * General Public License (GPL) version 3 or later.
+ */
+
+/*
+ * The file supports multiple operating modes:
+ * - WAIT_FOR_ZERO: Check that a semaphore value that is 0 is really 0.
+ *   Each thread has it's own semaphore value.
+ *   This problem can scale 100% linear.
+ *   For Linux, it does scale linear, at least to 8 sockets/80 cores.
+ * - Check that a semaphore value that is 0 is readlly 0.
+ *   Multiple threads share the same semaphore.
+ *   Not yet implemented.
+ * - PING_PONG: Each thread has it's own semaphore, but it needs to be
+ *   returned by a partner thread.
  */
 
 #include <stdio.h>
@@ -21,7 +34,7 @@
 #include <sys/resource.h>
 #include <pthread.h>
 
-#define SEM_WAITZERO_VERSION	"0.20"
+#define SEM_SCALEBENCH_VERSION	"0.20"
 
 #ifdef __sun
 	 #include <sys/pset.h> /* P_PID, processor_bind() */
@@ -97,7 +110,6 @@ int do_delay(int loops)
 
 #endif
 
-
 //////////////////////////////////////////////////////////////////////////////
 
 #define DELAY_10MS	(10000)
@@ -123,12 +135,156 @@ pthread_t *g_threads;
 
 struct taskinfo {
 	int svsem_id;
-	int svsem_nr;
 	int threadid;
-	int cpubind;
 	int interleave;
 	int delay;
 };
+
+//////////////////////////////////////////////////////////////////////////////
+
+#define WAIT_FOR_ZERO	1
+
+unsigned long long wait_for_zero(struct taskinfo *ti)
+{
+	unsigned long long rounds = 0;
+	int sem_own;
+	int ret;
+
+	sem_own = g_svsem_nrs[ti->threadid];
+
+	if (g_verbose >= VERBOSE_NORMAL) {
+		printf("thread %d: wait-for-zero, sema %8d\n",ti->threadid,
+				sem_own);
+	}
+
+	while(g_state == RUNNING) {
+		struct sembuf sop[1];
+
+		/* 1) check if the semaphore value is 0 */
+		sop[0].sem_num=sem_own;
+		sop[0].sem_op=0;
+		sop[0].sem_flg=0;
+		ret = semop(g_svsem_id,sop,1);
+		if (ret != 0) {
+			/* EIDRM can happen */
+			if (errno == EIDRM)
+				break;
+
+			printf("main semop failed, ret %d errno %d.\n", ret, errno);
+
+			/* Some OS do not report EIDRM properly */
+			if (g_state != RUNNING)
+				break;
+			printf(" round %lld sop: num %d op %d flg %d.\n",
+					rounds,
+					sop[0].sem_num, sop[0].sem_op, sop[0].sem_flg);
+			fflush(stdout);
+			exit(1);
+		}
+		if (ti->delay)
+			do_delay(ti->delay);
+		rounds++;
+	}
+	return rounds;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+#define PING_PONG 2
+
+unsigned long long ping_pong(struct taskinfo *ti)
+{
+	unsigned long long rounds = 0;
+	bool sender;
+	int sem_own;
+	int sem_partner;
+	int ret;
+
+	sender = ti->threadid % 2;
+	sem_own = g_svsem_nrs[ti->threadid];
+	sem_partner = g_svsem_nrs[ti->threadid + 1 - 2*(ti->threadid%2)];
+
+	if (g_verbose >= VERBOSE_NORMAL) {
+		printf("thread %d: ping-pong, sema %8d, partner %8d, sender %d\n",ti->threadid,
+				sem_own, sem_partner, sender);
+	}
+
+	if (sender) {
+		struct sembuf sop[1];
+
+		/* 1) insert token */
+		sop[0].sem_num=sem_own;
+		sop[0].sem_op=1;
+		sop[0].sem_flg=0;
+		ret = semop(g_svsem_id,sop,1);
+	
+		if (ret != 0) {
+			printf("Initial semop failed, ret %d, errno %d.\n", ret, errno);
+			exit(1);
+		}
+	}
+
+	while(g_state == RUNNING) {
+		struct sembuf sop[1];
+
+		/* 1) decrease the own semaphore */
+		sop[0].sem_num=sem_own;
+		sop[0].sem_op=-1;
+		sop[0].sem_flg=0;
+		ret = semop(g_svsem_id,sop,1);
+		if (ret != 0) {
+			/* EIDRM can happen */
+			if (errno == EIDRM)
+				break;
+
+			printf("main semop failed, ret %d errno %d.\n", ret, errno);
+
+			/* Some OS do not report EIDRM properly */
+			if (g_state != RUNNING)
+				break;
+			printf(" round %lld sop: num %d op %d flg %d.\n",
+					rounds,
+					sop[0].sem_num, sop[0].sem_op, sop[0].sem_flg);
+			fflush(stdout);
+			exit(1);
+		}
+		if (ti->delay)
+			do_delay(ti->delay);
+		rounds++;
+
+		/* 2) increase the partner's semaphore */
+		sop[0].sem_num=sem_partner;
+		sop[0].sem_op=1;
+		sop[0].sem_flg=0;
+		ret = semop(g_svsem_id,sop,1);
+		if (ret != 0) {
+			/* EIDRM can happen */
+			if (errno == EIDRM)
+				break;
+
+			printf("main semop failed, ret %d errno %d.\n", ret, errno);
+
+			/* Some OS do not report EIDRM properly */
+			if (g_state != RUNNING)
+				break;
+			printf(" round %lld sop: num %d op %d flg %d.\n",
+					rounds,
+					sop[0].sem_num, sop[0].sem_op, sop[0].sem_flg);
+			fflush(stdout);
+			exit(1);
+		}
+		if (ti->delay)
+			do_delay(ti->delay);
+
+		rounds++;
+	}
+	return rounds;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+int g_operation = WAIT_FOR_ZERO;
+
 
 int get_cpunr(int cpunr, int interleave)
 {
@@ -197,16 +353,13 @@ void* worker_thread(void *arg)
 {
 	struct taskinfo *ti = (struct taskinfo*)arg;
 	unsigned long long rounds;
-	int ret;
-	int cpu = get_cpunr(ti->cpubind, ti->interleave);
+	int cpu = get_cpunr(ti->threadid, ti->interleave);
 
 	bind_cpu(cpu);
 	if (g_verbose >= VERBOSE_NORMAL) {
-		printf("thread %d: sysvsem %8d, sema %8d bound to cpu %d\n",ti->threadid,
-				ti->svsem_id, ti->svsem_nr,cpu);
+		printf("thread %d: bound to cpu %d\n",ti->threadid, cpu);
 	}
 	
-	rounds = 0;
 	while(g_state == WAITING) {
 #ifdef __GNUC__
 #if defined(__i386__) || defined (__x86_64__)
@@ -216,35 +369,16 @@ void* worker_thread(void *arg)
 #endif
 #endif
 	}
-
-	while(g_state == RUNNING) {
-		struct sembuf sop[1];
-
-		/* 1) check if the semaphore value is 0 */
-		sop[0].sem_num=ti->svsem_nr;
-		sop[0].sem_op=0;
-		sop[0].sem_flg=0;
-		ret = semop(ti->svsem_id,sop,1);
-		if (ret != 0) {
-			/* EIDRM can happen */
-			if (errno == EIDRM)
-				break;
-
-			printf("main semop failed, ret %d errno %d.\n", ret, errno);
-
-			/* Some OS do not report EIDRM properly */
-			if (g_state != RUNNING)
-				break;
-			printf(" round %lld sop: num %d op %d flg %d.\n",
-					rounds,
-					sop[0].sem_num, sop[0].sem_op, sop[0].sem_flg);
-			fflush(stdout);
-			exit(1);
-		}
-		if (ti->delay)
-			do_delay(ti->delay);
-		rounds++;
+	if (g_operation == WAIT_FOR_ZERO) {
+		rounds = wait_for_zero(ti);
+	} else if (g_operation == PING_PONG) {
+		rounds = ping_pong(ti);
+	} else {
+		printf("Unknown operation.\n");
+		fflush(stdout);
+		exit(1);
 	}
+
 	g_results[ti->threadid].ops = rounds;
 	if (getrusage(RUSAGE_THREAD, &g_results[ti->threadid].ru)) {
 		printf("thread %p: getrusage failed, errno %d.\n",
@@ -280,10 +414,7 @@ void init_threads(int cpu, int cpus, int delay, int interleave)
 
 	g_results[cpu].ops = 0;
 
-	ti->svsem_id = g_svsem_id;
-	ti->svsem_nr = g_svsem_nrs[cpu];
 	ti->threadid = cpu;
-	ti->cpubind = cpu;
 	ti->interleave = interleave;
 	ti->delay = delay;
 
@@ -332,11 +463,12 @@ unsigned long long do_psem(int cpus, int timeout, int delay, int interleave)
 	totals = 0;
 	for (i=0;i<cpus;i++) {
 		if (g_verbose >= VERBOSE_NORMAL) {
-			printf("  Thread %3d: %8lld utime %ld.%06ld systime %ld.%06ld vol cswitch %ld invol cswitch %ld.\n",
+			printf("  Thread %3d: %8lld utime %ld.%06ld systime %ld.%06ld vol cswitch %ld invol cswitch %ld tot %ld.\n",
 				i, g_results[i].ops,
 				g_results[i].ru.ru_utime.tv_sec, g_results[i].ru.ru_utime.tv_usec,
 				g_results[i].ru.ru_stime.tv_sec, g_results[i].ru.ru_stime.tv_usec,
-				g_results[i].ru.ru_nvcsw, g_results[i].ru.ru_nivcsw);
+				g_results[i].ru.ru_nvcsw, g_results[i].ru.ru_nivcsw,
+				g_results[i].ru.ru_nvcsw + g_results[i].ru.ru_nivcsw);
 		}
 		totals += g_results[i].ops;
 	}
@@ -406,9 +538,9 @@ int main(int argc, char **argv)
 	maxdelay = 512;
 	forceall = 0;
 
-	printf("sem-waitzero\n");
+	printf("sem-scalebench\n");
 
-	while ((opt = getopt(argc, argv, "m:vt:i:c:d:p:f")) != -1) {
+	while ((opt = getopt(argc, argv, "m:vt:i:c:d:p:o:f")) != -1) {
 		switch(opt) {
 			case 'f':
 				forceall = 1;
@@ -450,16 +582,32 @@ int main(int argc, char **argv)
 					return 1;
 				}
 				break;
+			case 'o':
+				g_operation = atoi(optarg);
+				switch (g_operation) {
+					case WAIT_FOR_ZERO:
+					case PING_PONG:
+						break;
+					default:
+						printf(" Invalid operation requested.\n");
+						return 1;
+				}
+				break;
 			default: /* '?' */
-				printf(" sem-waitzero %s, (C) Manfred Spraul 1999-2013\n", SEM_WAITZERO_VERSION);
+				printf(" sem-scalebench-%s, (C) Manfred Spraul 1999-2014\n", SEM_SCALEBENCH_VERSION);
 				printf("\n");
-				printf(" Sem-waitzero performs parallel 'test-for-zero' sysv semaphore operations.\n");
+				printf(" Sem-scalebench performs parallel sysv semaphore operations.\n");
 				printf(" Each thread has it's own semaphore in one large semaphore array.\n");
-				printf(" The semaphores are always 0, i.e. the threads never sleep and no task\n");
-				printf(" switching will occur.\n");
-				printf(" This might be representative for a big-reader style lock. If the performance\n");
-				printf(" goes down when more cores are added then user space operations are performed\n");
-				printf(" until the maximum rate of semaphore operations is observed.\n");
+				printf(" The benchmark supports two tests:\n");
+				printf(" 1) Wait-for-zero:\n");
+				printf("    The semaphores are always 0, i.e. the threads never sleep and no task\n");
+				printf("    switching will occur.\n");
+				printf("    This might be representative for a big-reader style lock. If the performance\n");
+				printf("    goes down when more cores are added then user space operations are performed\n");
+				printf("    until the maximum rate of semaphore operations is observed.\n");
+				printf(" 2) Ping-Pong:\n");
+				printf("    Pairs of threads pass a token to each other. Each token passing forces\n");
+				printf("    a task switch.\n");
 				printf("\n");
 				printf(" Usage:\n");
 				printf("  -v: Verbose mode. Specify twice for more details\n");
@@ -469,6 +617,7 @@ int main(int argc, char **argv)
 				printf("  -p threads per core: Number of threads that should run on one core.\n");
 				printf("  -m: Max amount of user space operations (%s).\n", DELAY_ALGORITHM);
 				printf("  -d: Difference between the used semaphores, default 1.\n");
+				printf("  -o 1/2: Operation, either 1 (wait-for-zero) or 2 (ping-pong). Default 1.\n");
 				printf("  -f: Force to evaluate all cpu values.\n");
 				return 1;
 		}
@@ -547,16 +696,34 @@ int main(int argc, char **argv)
 			printf("  Cpu count %d: %d.\n", k, cpus[k]);
 		}
 	}
+	if (g_operation == WAIT_FOR_ZERO)
+		printf("Performing WAIT_FOR_ZERO operations.\n");
+	else
+		printf("Performing PING_PONG operations.\n");
+
 	for (k = 0; interleaves[k] != 0; k++) {
 		max_abs = 0;
 		for (j=0;;) {
 			max_totals = 0;
 			fastest = 0;
 			for (i=0; cpus[i] != 0; i++) {
-				totals = do_psem(cpus[i], timeout, j, interleaves[k]);
+				int cur_cpus;
+				
+				/*
+				 * PING_PONG is impossible with just 1 cpu and
+				 * needs an even thread count.
+				 */
+				cur_cpus = cpus[i];
+				if (g_operation == PING_PONG && cur_cpus == 1) {
+					totals = 0;
+				} else {
+					if (g_operation == PING_PONG && cur_cpus%2 != 0)
+						cur_cpus--;	
+					totals = do_psem(cur_cpus, timeout, j, interleaves[k]);
+				}
 				if (totals > max_totals) {
 					max_totals = totals;
-					fastest = cpus[i];
+					fastest = cur_cpus;
 				} else {
 					if (totals < 0.5*max_totals && cpus[i] > (2+1.5*fastest) && forceall == 0)
 						break;
