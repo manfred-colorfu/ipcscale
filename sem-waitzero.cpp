@@ -21,7 +21,7 @@
 #include <sys/resource.h>
 #include <pthread.h>
 
-#define SEM_WAITZERO_VERSION	"0.11"
+#define SEM_WAITZERO_VERSION	"0.20"
 
 #ifdef __sun
 	 #include <sys/pset.h> /* P_PID, processor_bind() */
@@ -117,6 +117,7 @@ struct tres *g_results;
 int g_svsem_id;
 int g_max_cpus;
 int g_sem_distance = 1;
+int g_threadspercore = 1;
 int *g_svsem_nrs;
 pthread_t *g_threads;
 
@@ -135,17 +136,17 @@ int get_cpunr(int cpunr, int interleave)
 	int ret = 0;
 
 	if (g_verbose >= VERBOSE_DEBUG) {
-		printf("get_cpunr %p: cpunr %d max_cpu %d interleave %d.\n",
-			(void*)pthread_self(), cpunr, g_max_cpus, interleave);
+		printf("get_cpunr %p: cpunr %d max_cpu %d interleave %d threadspercore %d.\n",
+			(void*)pthread_self(), cpunr, g_max_cpus, interleave, g_threadspercore);
 	}
 
-	while (cpunr>0) {
+	while (cpunr > g_threadspercore - 1) {
 		ret += interleave;
 		if (ret >=g_max_cpus) {
 			off++;
 			ret = off;
 		}
-		cpunr--;
+		cpunr -= g_threadspercore;
 	}
 	if (g_verbose >= VERBOSE_DEBUG) {
 		printf("get_cpunr %p: result %d.\n", (void*)pthread_self(), ret);
@@ -339,8 +340,8 @@ unsigned long long do_psem(int cpus, int timeout, int delay, int interleave)
 		}
 		totals += g_results[i].ops;
 	}
-	printf("Cpus %d, interleave %d delay %d: %lld in %d secs\n",
-			cpus, interleave, delay,
+	printf("Cpus %d, interleave %d threadspercore %d delay %d: %lld in %d secs\n",
+			cpus, interleave, g_threadspercore, delay,
 			totals, timeout);
 
 	free(g_results);
@@ -407,7 +408,7 @@ int main(int argc, char **argv)
 
 	printf("sem-waitzero\n");
 
-	while ((opt = getopt(argc, argv, "m:vt:i:c:d:f")) != -1) {
+	while ((opt = getopt(argc, argv, "m:vt:i:c:d:p:f")) != -1) {
 		switch(opt) {
 			case 'f':
 				forceall = 1;
@@ -418,17 +419,36 @@ int main(int argc, char **argv)
 			case 'i':
 				interleaves = decode_commastring(optarg);
 				break;
+			case 'p':
+				g_threadspercore = atoi(optarg);
+				if (g_threadspercore <= 0) {
+					printf(" Invalid number of threads per core specified.\n");
+					return 1;
+				}
+				break;
 			case 'c':
 				cpus = decode_commastring(optarg);
 				break;
 			case 't':
 				timeout = atoi(optarg);
+				if (timeout <= 0) {
+					printf(" Invalid timeout specified.\n");
+					return 1;
+				}
 				break;
 			case 'm':
 				maxdelay = atoi(optarg);
+				if (maxdelay < 0) {
+					printf(" Invalid maxdelay specified.\n");
+					return 1;
+				}
 				break;
 			case 'd':
 				g_sem_distance = atoi(optarg);
+				if (g_sem_distance < 0) {
+					printf(" Invalid semaphore distance specified.\n");
+					return 1;
+				}
 				break;
 			default: /* '?' */
 				printf(" sem-waitzero %s, (C) Manfred Spraul 1999-2013\n", SEM_WAITZERO_VERSION);
@@ -446,6 +466,7 @@ int main(int argc, char **argv)
 				printf("  -t x: Test duration, in seconds. Default 5.\n");
 				printf("  -c cpucount1,cpucount2: comma-separated list of cpu counts to use.\n");
 				printf("  -i interleave1,interleave2: comma-separated list of interleaves.\n");
+				printf("  -p threads per core: Number of threads that should run on one core.\n");
 				printf("  -m: Max amount of user space operations (%s).\n", DELAY_ALGORITHM);
 				printf("  -d: Difference between the used semaphores, default 1.\n");
 				printf("  -f: Force to evaluate all cpu values.\n");
