@@ -750,6 +750,8 @@ int main(int argc, char **argv)
 	for (k = 0; interleaves[k] != 0; k++) {
 		max_abs = 0;
 		for (j=0;;) {
+			bool last_is_fastest = false;
+
 			max_totals = 0;
 			fastest = 0;
 			for (i=0; threads[i] != 0; i++) {
@@ -761,7 +763,9 @@ int main(int argc, char **argv)
 				if (totals > max_totals) {
 					max_totals = totals;
 					fastest = cur_cpus;
+					last_is_fastest = true;
 				} else {
+					last_is_fastest = false;
 					if (totals < 0.5*max_totals && threads[i] > (2+1.5*fastest) && forceall == 0)
 						break;
 				}
@@ -772,7 +776,7 @@ int main(int argc, char **argv)
 			if (max_abs < max_totals)
 				max_abs = max_totals;
 
-			if (fastest == g_max_cpus)
+			if (last_is_fastest)
 				break;
 			if (j >= maxdelay)
 				break;
