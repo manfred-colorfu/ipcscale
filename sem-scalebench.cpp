@@ -133,11 +133,9 @@ struct tres {
 };
 
 struct tres *g_results;
-int g_svsem_id;
 int g_max_cpus;
 int g_sem_distance = 1;
 int g_threadspercore = 1;
-int *g_svsem_nrs;
 pthread_t *g_threads;
 
 struct taskinfo {
@@ -149,9 +147,38 @@ struct taskinfo {
 
 //////////////////////////////////////////////////////////////////////////////
 
+int g_svsem_id;
+int *g_svsem_nrs;
+
+void sysv_prepare(int threads)
+{
+	int i;
+	g_svsem_id = semget(IPC_PRIVATE, g_sem_distance*threads,0777|IPC_CREAT);
+	if(g_svsem_id == -1) {
+		printf("sem array create failed.\n");
+		exit(1);
+	}
+	for (i=0;i<threads;i++)
+		g_svsem_nrs[i] = g_sem_distance - 1 +
+					g_sem_distance*i;
+}
+
+void sysv_cleanup(void)
+{
+	int res;
+	res = semctl(g_svsem_id,1,IPC_RMID,NULL);
+	if (res < 0) {
+		printf("semctl(IPC_RMID) failed for %d, errno%d.\n",
+			g_svsem_id, errno);
+	}
+}
+
+
+//////////////////////////////////////////////////////////////////////////////
+
 #define WAIT_FOR_ZERO	1
 
-unsigned long long wait_for_zero(struct taskinfo *ti)
+unsigned long long wait_for_zero_do(struct taskinfo *ti)
 {
 	unsigned long long rounds = 0;
 	int sem_own;
@@ -199,7 +226,7 @@ unsigned long long wait_for_zero(struct taskinfo *ti)
 
 #define PING_PONG 2
 
-unsigned long long ping_pong(struct taskinfo *ti)
+unsigned long long ping_pong_do(struct taskinfo *ti)
 {
 	unsigned long long rounds = 0;
 	bool sender;
@@ -290,8 +317,31 @@ unsigned long long ping_pong(struct taskinfo *ti)
 
 //////////////////////////////////////////////////////////////////////////////
 
-int g_operation = WAIT_FOR_ZERO;
+struct task_desc{
+	int id;
+	const char * name;
+	void (*prepare)(int threads);
+	unsigned long long (*do_op)(struct taskinfo *ti);
+	void (*cleanup)(void);
+	int granularity;
+};
 
+struct task_desc g_supported_tasks[] = {
+		{ WAIT_FOR_ZERO, "sysv sem wait-for-zero",
+			sysv_prepare,
+			wait_for_zero_do,
+			sysv_cleanup,
+			1 },
+		{ PING_PONG, "sysv sem ping-pong",
+			sysv_prepare,
+			ping_pong_do,
+			sysv_cleanup,
+			2 }
+		};
+
+struct task_desc *g_operation = &g_supported_tasks[0];
+
+//////////////////////////////////////////////////////////////////////////////
 
 int get_cpunr(int threadnr, int interleave)
 {
@@ -376,15 +426,7 @@ void* worker_thread(void *arg)
 #endif
 #endif
 	}
-	if (g_operation == WAIT_FOR_ZERO) {
-		rounds = wait_for_zero(ti);
-	} else if (g_operation == PING_PONG) {
-		rounds = ping_pong(ti);
-	} else {
-		printf("Unknown operation.\n");
-		fflush(stdout);
-		exit(1);
-	}
+	rounds = g_operation->do_op(ti);
 
 	g_results[ti->threadid].ops = rounds;
 	if (getrusage(RUSAGE_THREAD, &g_results[ti->threadid].ru)) {
@@ -406,18 +448,6 @@ void init_threads(int thread, int threads, int delay, int interleave)
 		printf("Could not allocate task info\n");
 		exit(1);
 	}
-	if (thread == 0) {
-		int i;
-		g_svsem_id = semget(IPC_PRIVATE,
-				g_sem_distance*threads,0777|IPC_CREAT);
-		if(g_svsem_id == -1) {
-			printf("sem array create failed.\n");
-			exit(1);
-		}
-		for (i=0;i<threads;i++)
-			g_svsem_nrs[i] = g_sem_distance - 1 +
-						g_sem_distance*i;
-	}
 
 	g_results[thread].ops = 0;
 
@@ -438,13 +468,14 @@ unsigned long long do_psem(int threads, int timeout, int delay, int interleave)
 {
 	unsigned long long totals;
 	int i;
-	int res;
 
 	g_state = WAITING;
 
 	g_results = (struct tres *)malloc(sizeof(struct tres)*threads);
 	g_svsem_nrs = (int*)malloc(sizeof(int)*threads);
 	g_threads = (pthread_t*)malloc(sizeof(pthread_t)*threads);
+
+	g_operation->prepare(threads);
 
 	for (i=0;i<threads;i++)
 		init_threads(i, threads, delay, interleave);
@@ -455,11 +486,7 @@ unsigned long long do_psem(int threads, int timeout, int delay, int interleave)
 	g_state = STOPPED;
 	usleep(DELAY_10MS);
 
-	res = semctl(g_svsem_id,1,IPC_RMID,NULL);
-	if (res < 0) {
-		printf("semctl(IPC_RMID) failed for %d, errno%d.\n",
-			g_svsem_id, errno);
-	}
+	g_operation->cleanup();
 
 	for (i=0;i<threads;i++)
 		pthread_join(g_threads[i], NULL);
@@ -597,15 +624,13 @@ int main(int argc, char **argv)
 				}
 				break;
 			case 'o':
-				g_operation = atoi(optarg);
-				switch (g_operation) {
-					case WAIT_FOR_ZERO:
-					case PING_PONG:
-						break;
-					default:
-						printf(" Invalid operation requested.\n");
-						return 1;
+				i = atoi(optarg);
+				i--;
+				if (i < 0 || i >= (int)(sizeof(g_supported_tasks)/sizeof(g_supported_tasks[0]))) {
+					printf(" Invalid operation requested.\n");
+					return 1;
 				}
+				g_operation = &g_supported_tasks[i];
 				break;
 			default: /* '?' */
 				printf(" sem-scalebench-%s, (C) Manfred Spraul 1999-2014\n", SEM_SCALEBENCH_VERSION);
@@ -678,31 +703,29 @@ int main(int argc, char **argv)
 		threads[i] = g_max_cpus*g_threadspercore;
 		threads[i+1] = 0;
 	}
-	switch (g_operation) {
-		case PING_PONG:
-			/* ping-pong supports only even cpu numbers */
-			i=0;
-			while (threads[i] != 0) {
-				/* task 1: round down, but never to 0 */
-				threads[i] = (threads[i]/2)*2;
-				if (threads[i] == 0)
-					threads[i] = 2;
 
-				/* task 2: remove duplicates */
-				if (i > 0 && threads[i-1] == threads[i]) {
-					j=i;
-					while(threads[j] != 0) {
-						threads[j] = threads[j+1];
-						j++;
-					}
-				} else {
-					i++;
+	if (g_operation->granularity > 1) {
+		/* ping-pong supports only even cpu numbers */
+		i=0;
+		while (threads[i] != 0) {
+			/* task 1: round down, but never to 0 */
+			threads[i] = (threads[i]/2)*2;
+			if (threads[i] == 0)
+				threads[i] = 2;
+
+			/* task 2: remove duplicates */
+			if (i > 0 && threads[i-1] == threads[i]) {
+				j=i;
+				while(threads[j] != 0) {
+					threads[j] = threads[j+1];
+					j++;
 				}
+			} else {
+				i++;
 			}
-			break;
-		default:
-			break;
+		}
 	}
+
 	if (g_max_cpus == 0) {
 		g_max_cpus = units_roundedup(threads[0], g_threadspercore);
 		i = 1;
@@ -742,10 +765,7 @@ int main(int argc, char **argv)
 		}
 		printf("  g_max_cpus: %d.\n", g_max_cpus);
 	}
-	if (g_operation == WAIT_FOR_ZERO)
-		printf("Performing WAIT_FOR_ZERO operations.\n");
-	else
-		printf("Performing PING_PONG operations.\n");
+	printf("Performing %s operations.\n", g_operation->name);
 
 	for (k = 0; interleaves[k] != 0; k++) {
 		max_abs = 0;
