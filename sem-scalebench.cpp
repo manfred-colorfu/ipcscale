@@ -751,7 +751,7 @@ int main(int argc, char **argv)
 				printf("  -h highest core number that should be used.\n");
 				printf("  -m: Max amount of user space operations (%s).\n", DELAY_ALGORITHM);
 				printf("  -d: Difference between the used semaphores, default 1.\n");
-				printf("  -o 1/2: Operation, either 1 (wait-for-zero) or 2 (ping-pong). Default 1.\n");
+				printf("  -o 1/2/3: Operation, see above. Default 1.\n");
 				printf("  -f: Force to evaluate all thread values.\n");
 				return 1;
 		}
