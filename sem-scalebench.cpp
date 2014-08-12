@@ -19,6 +19,7 @@
  *   Not yet implemented.
  * - PING_PONG: Each thread has it's own semaphore, but it needs to be
  *   returned by a partner thread.
+ * - PING_PONG, based on posix semaphores.
  */
 
 #include <stdio.h>
@@ -33,6 +34,7 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <pthread.h>
+#include <semaphore.h>
 
 #define SEM_SCALEBENCH_VERSION	"0.20"
 
@@ -139,11 +141,47 @@ int g_threadspercore = 1;
 pthread_t *g_threads;
 
 struct taskinfo {
-	int svsem_id;
 	int threadid;
 	int interleave;
 	int delay;
 };
+
+//////////////////////////////////////////////////////////////////////////////
+
+sem_t *g_posix_sem_array;
+sem_t **g_posix_sem_ptrs;
+int g_posix_threads;
+
+void posix_prepare(int threads)
+{
+	int i;
+
+	g_posix_sem_array = (sem_t*)malloc(threads*g_sem_distance*sizeof(sem_t));
+	g_posix_sem_ptrs = (sem_t**)malloc(threads*sizeof(sem_t*));
+	g_posix_threads = threads;
+	if(g_posix_sem_array == NULL || g_posix_sem_ptrs == NULL) {
+		printf("sem alloc failed.\n");
+		exit(1);
+	}
+	for (i=0;i<threads;i++) {
+		g_posix_sem_ptrs[i] = &g_posix_sem_array[g_sem_distance - 1 + g_sem_distance*i];
+		sem_init(g_posix_sem_ptrs[i], 0, 0);
+	}
+}
+
+void posix_cleanup(void)
+{
+	int i;
+
+	/* increase the semaphore twice, force a wake-up for all tasks */
+	for (i=0;i<g_posix_threads;i++) {
+		sem_post(g_posix_sem_ptrs[i]);
+		sem_post(g_posix_sem_ptrs[i]);
+	}
+	usleep(DELAY_10MS);
+	free(g_posix_sem_array);
+	free(g_posix_sem_ptrs);
+}
 
 //////////////////////////////////////////////////////////////////////////////
 
@@ -317,6 +355,51 @@ unsigned long long ping_pong_do(struct taskinfo *ti)
 
 //////////////////////////////////////////////////////////////////////////////
 
+#define POSIX_PING_PONG 3
+
+unsigned long long posix_ping_pong_do(struct taskinfo *ti)
+{
+	unsigned long long rounds = 0;
+	bool sender;
+	sem_t *sem_own, *sem_partner;
+
+	sender = ti->threadid % 2;
+	sem_own = g_posix_sem_ptrs[ti->threadid];
+	sem_partner = g_posix_sem_ptrs[ti->threadid + 1 - 2*(ti->threadid%2)];
+
+	if (g_verbose >= VERBOSE_NORMAL) {
+		printf("thread %d: ping-pong, sema %p, partner %p, sender %d\n",ti->threadid,
+				sem_own, sem_partner, sender);
+	}
+
+	if (sender) {
+		sem_post(sem_own);
+	}
+
+	while(g_state == RUNNING) {
+		sem_wait(sem_own);
+
+		if (g_state != RUNNING)
+			break;
+
+		if (ti->delay)
+			do_delay(ti->delay);
+		rounds++;
+
+		/* 2) increase the partner's semaphore */
+		sem_post(sem_partner);
+		if (g_state != RUNNING)
+			break;
+
+		if (ti->delay)
+			do_delay(ti->delay);
+
+		rounds++;
+	}
+	return rounds;
+}
+//////////////////////////////////////////////////////////////////////////////
+
 struct task_desc{
 	int id;
 	const char * name;
@@ -336,6 +419,11 @@ struct task_desc g_supported_tasks[] = {
 			sysv_prepare,
 			ping_pong_do,
 			sysv_cleanup,
+			2 },
+		{ POSIX_PING_PONG, "posix sem ping-pong",
+			posix_prepare,
+			posix_ping_pong_do,
+			posix_cleanup,
 			2 }
 		};
 
@@ -506,7 +594,7 @@ unsigned long long do_psem(int threads, int timeout, int delay, int interleave)
 		}
 		totals += g_results[i].ops;
 	}
-	printf("Cpus %d, interleave %d threadspercore %d delay %d: %lld in %d secs\n",
+	printf("Threads %d, interleave %d threadspercore %d delay %d: %lld in %d secs\n",
 			threads, interleave, g_threadspercore, delay,
 			totals, timeout);
 
@@ -635,20 +723,24 @@ int main(int argc, char **argv)
 			default: /* '?' */
 				printf(" sem-scalebench-%s, (C) Manfred Spraul 1999-2014\n", SEM_SCALEBENCH_VERSION);
 				printf("\n");
-				printf(" Sem-scalebench performs parallel sysv semaphore operations.\n");
-				printf(" Each thread has it's own semaphore in one large semaphore array.\n");
-				printf(" The benchmark supports two tests:\n");
-				printf(" 1) Wait-for-zero:\n");
+				printf(" Sem-scalebench performs parallel synchronization operations.\n");
+				printf(" For sysvsem, each thread has it's own semaphore in one large semaphore array.\n");
+				printf(" The benchmark supports three tests:\n");
+				printf(" 1) sysvsem Wait-for-zero:\n");
 				printf("    The semaphores are always 0, i.e. the threads never sleep and no task\n");
 				printf("    switching will occur.\n");
-				printf("    This might be representative for a big-reader style lock. If the performance\n");
-				printf("    goes down when more cores are added then user space operations are performed\n");
-				printf("    until the maximum rate of semaphore operations is observed.\n");
-				printf(" 2) Ping-Pong:\n");
+				printf("    This might be representative for a big-reader style lock. If the\n");
+				printf("    performance goes down when more cores are added then user space\n");
+				printf("    operations are performed until the maximum rate of semaphore operations\n");
+				printf("    is observed.\n");
+				printf(" 2) sysvsem ping-pong:\n");
 				printf("    Pairs of threads pass a token to each other. Each token passing forces\n");
 				printf("    a task switch.\n");
-				printf(" First up to <threads per core> threads are put on core 0, then the next thread(s)\n");
-				printf(" are placed to the core <interleave>.\n");
+				printf(" 3) posix semaphore ping-pong:\n");
+				printf("    Pairs of threads pass a token to each other. Each token passing forces\n");
+				printf("    a task switch.\n");
+				printf(" First up to <threads per core> threads are put on core 0, then the next\n");
+				printf(" thread(s) are placed to the core <interleave>.\n");
 				printf("\n");
 				printf(" Usage:\n");
 				printf("  -v: Verbose mode. Specify twice for more details\n");
