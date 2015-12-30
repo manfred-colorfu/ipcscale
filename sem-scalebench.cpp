@@ -1,7 +1,7 @@
 /*
  * sem-scalebench.cpp - sysv scaling test
  *
-* Copyright (C) 1999, 2001, 2005, 2008, 2013 by Manfred Spraul.
+ * Copyright (C) 1999, 2001, 2005, 2008, 2013, 2015 by Manfred Spraul.
  *	All rights reserved except the rights granted by the GPL.
  *
  * Redistribution of this file is permitted under the terms of the GNU 
@@ -14,13 +14,19 @@
  *   Each thread has it's own semaphore value.
  *   This problem can scale 100% linear.
  *   For Linux, it does scale linear, at least to 8 sockets/80 cores.
- * - Check that a semaphore value that is 0 is readlly 0.
+ * - Check that a semaphore value that is 0 is really 0.
  *   Multiple threads share the same semaphore.
  *   Not yet implemented.
  * - PING_PONG: Each thread has it's own semaphore, but it needs to be
  *   returned by a partner thread.
- * - PING_PONG, based on posix semaphores.
+ * - POSIX_PING_PONG, based on posix semaphores.
  */
+
+///
+/// @file
+///
+/// The whole benchmark is contained in this file.
+/// 
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,7 +42,7 @@
 #include <pthread.h>
 #include <semaphore.h>
 
-#define SEM_SCALEBENCH_VERSION	"0.20"
+#define SEM_SCALEBENCH_VERSION	"0.30"
 
 #ifdef __sun
 	 #include <sys/pset.h> /* P_PID, processor_bind() */
@@ -46,10 +52,23 @@
 #define	VERBOSE_NORMAL	1
 #define VERBOSE_OFF	0
 
+///
+/// \brief global setting to enable more verbose output
+///
+/// g_verbose is used to set the logging level.
+/// - VERBOSE_OFF (0) means no logs
+/// - VERBOSE_NORMAL (1) means some logs
+/// - VERBOSE_DEBUG (2) prints internal details, only relevant for debugging
+///
 int g_verbose = 0;
 
 //////////////////////////////////////////////////////////////////////////////
 
+/** \brief divide and round up
+ *
+ * Some tests need a certain number of threads.
+ * for these tests, add more threads as necessary
+ */
 static inline int units_roundedup(int value, int unit)
 {
 	return (value+unit-1)/unit;
@@ -135,9 +154,11 @@ struct tres {
 };
 
 struct tres *g_results;
+int g_numthreads;
 int g_max_cpus;
 int g_sem_distance = 1;
 int g_threadspercore = 1;
+unsigned long g_masterlock = 0;
 pthread_t *g_threads;
 
 struct taskinfo {
@@ -264,6 +285,64 @@ unsigned long long wait_for_zero_do(struct taskinfo *ti)
 
 #define PING_PONG 2
 
+int do_biglock(int odd_even)
+{
+	struct sembuf *sops;
+	int i;
+	int ret;
+
+	sops = (struct sembuf *)malloc(sizeof(struct sembuf)*g_numthreads/2);
+	if (!sops) {
+		printf(" do_biglock(%d): malloc failed.\n", odd_even);
+		fflush(stdout);
+		exit(1);
+	}
+
+	for (i=0;i<g_numthreads/2;i++) {
+		/* 1) remove token */
+		sops[i].sem_num = g_svsem_nrs[2*i+!odd_even];
+		sops[i].sem_op=-1;
+		sops[i].sem_flg=0;
+	}
+	ret = semop(g_svsem_id,sops,g_numthreads/2);
+	if (ret != 0) {
+		/* EIDRM can happen */
+		if (errno == EIDRM)
+			return 1;
+
+		/* Some OS do not report EIDRM properly */
+		if (g_state != RUNNING)
+			return 1;
+		printf(" do_biglock(%d): decrease semop failed: ret %d errno %d.\n", odd_even, ret, errno);
+		fflush(stdout);
+		exit(1);
+	}
+
+	for (i=0;i<g_numthreads/2;i++) {
+		/* 1) insert token */
+		sops[i].sem_num = g_svsem_nrs[2*i+!odd_even];
+		sops[i].sem_op=1;
+		sops[i].sem_flg=0;
+	}
+	ret = semop(g_svsem_id,sops,g_numthreads/2);
+	if (ret != 0) {
+		/* EIDRM can happen */
+		if (errno == EIDRM)
+			return 1;
+
+		printf("biglock semop failed, ret %d errno %d.\n", ret, errno);
+
+		/* Some OS do not report EIDRM properly */
+		if (g_state != RUNNING)
+			return 1;
+		printf(" do_biglock(%d): increase semop failed: ret %d errno %d.\n", odd_even, ret, errno);
+		fflush(stdout);
+		exit(1);
+	}
+	free(sops);
+	return 0;
+}
+
 unsigned long long ping_pong_do(struct taskinfo *ti)
 {
 	unsigned long long rounds = 0;
@@ -271,6 +350,7 @@ unsigned long long ping_pong_do(struct taskinfo *ti)
 	int sem_own;
 	int sem_partner;
 	int ret;
+	unsigned long masterpos;
 
 	sender = ti->threadid % 2;
 	sem_own = g_svsem_nrs[ti->threadid];
@@ -279,6 +359,17 @@ unsigned long long ping_pong_do(struct taskinfo *ti)
 	if (g_verbose >= VERBOSE_NORMAL) {
 		printf("thread %d: ping-pong, sema %8d, partner %8d, sender %d\n",ti->threadid,
 				sem_own, sem_partner, sender);
+	}
+
+	if (g_masterlock > 0) {
+		masterpos = (g_masterlock * ti->threadid * 0.61803398875);
+		masterpos = masterpos % g_masterlock;
+		if (g_verbose >= VERBOSE_NORMAL) {
+			printf("thread %d: masterpos %lu masterlock %lu\n",
+					ti->threadid, masterpos, g_masterlock);
+		}
+	} else {
+		masterpos = 0;
 	}
 
 	if (sender) {
@@ -349,6 +440,21 @@ unsigned long long ping_pong_do(struct taskinfo *ti)
 			do_delay(ti->delay);
 
 		rounds++;
+
+		/*
+		 * lock all semaphores - force a complex operation that is highly likely
+		 * to sleep.
+		 * - only every g_masterlock/2 semaphore operations
+		 * - not all threads at the same time, instead spread based on the golden
+		 *   ratio.
+		 * - only wait for the half of the semaphores that contains tokens.
+		 */
+		if (g_masterlock > 0 && (rounds/2)%g_masterlock == masterpos) {
+			if(do_biglock(sem_partner%2))
+				break;
+		}
+
+
 	}
 	return rounds;
 }
@@ -559,6 +665,8 @@ unsigned long long do_psem(int threads, int timeout, int delay, int interleave)
 
 	g_state = WAITING;
 
+	g_numthreads = threads;
+
 	g_results = (struct tres *)malloc(sizeof(struct tres)*threads);
 	g_svsem_nrs = (int*)malloc(sizeof(int)*threads);
 	g_threads = (pthread_t*)malloc(sizeof(pthread_t)*threads);
@@ -662,7 +770,7 @@ int main(int argc, char **argv)
 
 	printf("sem-scalebench\n");
 
-	while ((opt = getopt(argc, argv, "m:vt:i:c:d:p:o:h:f")) != -1) {
+	while ((opt = getopt(argc, argv, "m:vt:i:c:d:p:o:x:h:f")) != -1) {
 		switch(opt) {
 			case 'f':
 				forceall = 1;
@@ -711,6 +819,13 @@ int main(int argc, char **argv)
 					return 1;
 				}
 				break;
+			case 'x':
+				g_masterlock = atoi(optarg);
+				if (g_masterlock <= 0) {
+					printf(" Invalid number of threads per core specified.\n");
+					return 1;
+				}
+				break;
 			case 'o':
 				i = atoi(optarg);
 				i--;
@@ -721,7 +836,7 @@ int main(int argc, char **argv)
 				g_operation = &g_supported_tasks[i];
 				break;
 			default: /* '?' */
-				printf(" sem-scalebench-%s, (C) Manfred Spraul 1999-2014\n", SEM_SCALEBENCH_VERSION);
+				printf(" sem-scalebench-%s, (C) Manfred Spraul 1999-2015\n", SEM_SCALEBENCH_VERSION);
 				printf("\n");
 				printf(" Sem-scalebench performs parallel synchronization operations.\n");
 				printf(" For sysvsem, each thread has it's own semaphore in one large semaphore array.\n");
@@ -753,6 +868,8 @@ int main(int argc, char **argv)
 				printf("  -d: Difference between the used semaphores, default 1.\n");
 				printf("  -o 1/2/3: Operation, see above. Default 1.\n");
 				printf("  -f: Force to evaluate all thread values.\n");
+				printf("  -x: complex op distance (only sysvsem ping-pong): perform a complex operation\n");
+				printf("      every <2*complex op distance> normal operations\n");
 				return 1;
 		}
 	}
