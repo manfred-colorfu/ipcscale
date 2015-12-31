@@ -42,7 +42,7 @@
 #include <pthread.h>
 #include <semaphore.h>
 
-#define SEM_SCALEBENCH_VERSION	"0.30"
+#define SEM_SCALEBENCH_VERSION	"0.31"
 
 #ifdef __sun
 	 #include <sys/pset.h> /* P_PID, processor_bind() */
@@ -285,26 +285,41 @@ unsigned long long wait_for_zero_do(struct taskinfo *ti)
 
 #define PING_PONG 2
 
-int do_biglock(int odd_even)
+int do_biglock(struct taskinfo *ti, int odd_even, int half)
 {
 	struct sembuf *sops;
 	int i;
+	int limit;
 	int ret;
 
-	sops = (struct sembuf *)malloc(sizeof(struct sembuf)*g_numthreads/2);
+	limit = (g_numthreads+3)/4;
+	if (g_numthreads < 4) {
+		half = 0;
+	} else {
+		if ( (limit-1)*4+2*half+!odd_even >= g_numthreads) {
+			limit--;
+		}
+	}
+
+	if (g_verbose >= VERBOSE_DEBUG) {
+		printf("thread %d: do_biglock(odd_even=%d,half=%d): g_numthreads %d limit %d.\n",
+				ti->threadid, odd_even, half, g_numthreads, limit);
+	}
+
+	sops = (struct sembuf *)malloc(sizeof(struct sembuf)*limit);
 	if (!sops) {
 		printf(" do_biglock(%d): malloc failed.\n", odd_even);
 		fflush(stdout);
 		exit(1);
 	}
 
-	for (i=0;i<g_numthreads/2;i++) {
+	for (i=0;i<limit;i++) {
 		/* 1) remove token */
-		sops[i].sem_num = g_svsem_nrs[2*i+!odd_even];
+		sops[i].sem_num = g_svsem_nrs[4*i+2*half+!odd_even];
 		sops[i].sem_op=-1;
 		sops[i].sem_flg=0;
 	}
-	ret = semop(g_svsem_id,sops,g_numthreads/2);
+	ret = semop(g_svsem_id,sops,limit);
 	if (ret != 0) {
 		/* EIDRM can happen */
 		if (errno == EIDRM)
@@ -318,13 +333,13 @@ int do_biglock(int odd_even)
 		exit(1);
 	}
 
-	for (i=0;i<g_numthreads/2;i++) {
+	for (i=0;i<limit;i++) {
 		/* 1) insert token */
-		sops[i].sem_num = g_svsem_nrs[2*i+!odd_even];
+		sops[i].sem_num = g_svsem_nrs[4*i+2*half+!odd_even];
 		sops[i].sem_op=1;
 		sops[i].sem_flg=0;
 	}
-	ret = semop(g_svsem_id,sops,g_numthreads/2);
+	ret = semop(g_svsem_id,sops,limit);
 	if (ret != 0) {
 		/* EIDRM can happen */
 		if (errno == EIDRM)
@@ -447,10 +462,9 @@ unsigned long long ping_pong_do(struct taskinfo *ti)
 		 * - only every g_masterlock/2 semaphore operations
 		 * - not all threads at the same time, instead spread based on the golden
 		 *   ratio.
-		 * - only wait for the half of the semaphores that contains tokens.
 		 */
 		if (g_masterlock > 0 && (rounds/2)%g_masterlock == masterpos) {
-			if(do_biglock(sem_partner%2))
+			if(do_biglock(ti, sem_partner%2, (sem_partner/2)%2))
 				break;
 		}
 
@@ -821,8 +835,8 @@ int main(int argc, char **argv)
 				break;
 			case 'x':
 				g_masterlock = atoi(optarg);
-				if (g_masterlock <= 0) {
-					printf(" Invalid number of threads per core specified.\n");
+				if (g_masterlock < 0) {
+					printf(" Invalid masterlock distance specified.\n");
 					return 1;
 				}
 				break;
