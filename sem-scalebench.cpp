@@ -518,6 +518,87 @@ unsigned long long posix_ping_pong_do(struct taskinfo *ti)
 	}
 	return rounds;
 }
+
+///////////////////////////////////////////////////////////////////////////////
+//
+// based on client/server example from IBM:
+//
+// https://www.ibm.com/support/knowledgecenter/ssw_i5_54/apiref/apiexusmem.htm
+//
+// Note:
+// - Only a part of the algorithm is implemented.
+// - The code never sleeps.
+
+#define COMPLEX_NOWAIT	4
+
+unsigned long long complex_nowait_do(struct taskinfo *ti)
+{
+	unsigned long long rounds = 0;
+	int sem_own;
+	int ret;
+
+	sem_own = g_svsem_nrs[ti->threadid];
+
+	if (g_verbose >= VERBOSE_NORMAL) {
+		printf("thread %d: complex_nowait, sema %8d\n",ti->threadid,
+				sem_own);
+	}
+
+	while(g_state == RUNNING) {
+		struct sembuf sop[2];
+
+		/* 1) client: wait for zero and set to 1 */
+		sop[0].sem_num=sem_own;
+		sop[0].sem_op=0;
+		sop[0].sem_flg=0;
+		sop[1].sem_num=sem_own;
+		sop[1].sem_op=1;
+		sop[1].sem_flg=0;
+		ret = semop(g_svsem_id,sop,2);
+		if (ret != 0) {
+			/* EIDRM can happen */
+			if (errno == EIDRM)
+				break;
+
+			printf("main semop failed, ret %d errno %d.\n", ret, errno);
+
+			/* some os do not report EIDRM properly */
+			if (g_state != RUNNING)
+				break;
+			printf(" round %lld sop: num %d op %d flg %d.\n",
+					rounds,
+					sop[0].sem_num, sop[0].sem_op, sop[0].sem_flg);
+			fflush(stdout);
+			exit(1);
+		}
+		/* 2) client: dec back to 1 */
+		sop[0].sem_num=sem_own;
+		sop[0].sem_op=-1;
+		sop[0].sem_flg=0;
+		ret = semop(g_svsem_id,sop,1);
+		if (ret != 0) {
+			/* EIDRM can happen */
+			if (errno == EIDRM)
+				break;
+
+			printf("main semop failed, ret %d errno %d.\n", ret, errno);
+
+			/* some os do not report EIDRM properly */
+			if (g_state != RUNNING)
+				break;
+			printf(" round %lld sop: num %d op %d flg %d.\n",
+					rounds,
+					sop[0].sem_num, sop[0].sem_op, sop[0].sem_flg);
+			fflush(stdout);
+			exit(1);
+		}
+		if (ti->delay)
+			do_delay(ti->delay);
+		rounds++;
+	}
+	return rounds;
+}
+
 //////////////////////////////////////////////////////////////////////////////
 
 struct task_desc{
@@ -544,7 +625,12 @@ struct task_desc g_supported_tasks[] = {
 			posix_prepare,
 			posix_ping_pong_do,
 			posix_cleanup,
-			2 }
+			2 },
+		{ COMPLEX_NOWAIT, "sysv sem complex nowait",
+			sysv_prepare,
+			complex_nowait_do,
+			sysv_cleanup,
+			1 },
 		};
 
 struct task_desc *g_operation = &g_supported_tasks[0];
