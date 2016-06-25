@@ -158,7 +158,7 @@ int g_numthreads;
 int g_max_cpus;
 int g_sem_distance = 1;
 int g_threadspercore = 1;
-unsigned long g_masterlock = 0;
+unsigned long g_complex_op = 0;
 pthread_t *g_threads;
 
 struct taskinfo {
@@ -285,79 +285,6 @@ unsigned long long wait_for_zero_do(struct taskinfo *ti)
 
 #define PING_PONG 2
 
-int do_biglock(struct taskinfo *ti, int odd_even, int half)
-{
-	struct sembuf *sops;
-	int i;
-	int limit;
-	int ret;
-
-	limit = (g_numthreads+3)/4;
-	if (g_numthreads < 4) {
-		half = 0;
-	} else {
-		if ( (limit-1)*4+2*half+!odd_even >= g_numthreads) {
-			limit--;
-		}
-	}
-
-	if (g_verbose >= VERBOSE_DEBUG) {
-		printf("thread %d: do_biglock(odd_even=%d,half=%d): g_numthreads %d limit %d.\n",
-				ti->threadid, odd_even, half, g_numthreads, limit);
-	}
-
-	sops = (struct sembuf *)malloc(sizeof(struct sembuf)*limit);
-	if (!sops) {
-		printf(" do_biglock(%d): malloc failed.\n", odd_even);
-		fflush(stdout);
-		exit(1);
-	}
-
-	for (i=0;i<limit;i++) {
-		/* 1) remove token */
-		sops[i].sem_num = g_svsem_nrs[4*i+2*half+!odd_even];
-		sops[i].sem_op=-1;
-		sops[i].sem_flg=0;
-	}
-	ret = semop(g_svsem_id,sops,limit);
-	if (ret != 0) {
-		/* EIDRM can happen */
-		if (errno == EIDRM)
-			return 1;
-
-		/* Some OS do not report EIDRM properly */
-		if (g_state != RUNNING)
-			return 1;
-		printf(" do_biglock(%d): decrease semop failed: ret %d errno %d.\n", odd_even, ret, errno);
-		fflush(stdout);
-		exit(1);
-	}
-
-	for (i=0;i<limit;i++) {
-		/* 1) insert token */
-		sops[i].sem_num = g_svsem_nrs[4*i+2*half+!odd_even];
-		sops[i].sem_op=1;
-		sops[i].sem_flg=0;
-	}
-	ret = semop(g_svsem_id,sops,limit);
-	if (ret != 0) {
-		/* EIDRM can happen */
-		if (errno == EIDRM)
-			return 1;
-
-		printf("biglock semop failed, ret %d errno %d.\n", ret, errno);
-
-		/* Some OS do not report EIDRM properly */
-		if (g_state != RUNNING)
-			return 1;
-		printf(" do_biglock(%d): increase semop failed: ret %d errno %d.\n", odd_even, ret, errno);
-		fflush(stdout);
-		exit(1);
-	}
-	free(sops);
-	return 0;
-}
-
 unsigned long long ping_pong_do(struct taskinfo *ti)
 {
 	unsigned long long rounds = 0;
@@ -376,12 +303,12 @@ unsigned long long ping_pong_do(struct taskinfo *ti)
 				sem_own, sem_partner, sender);
 	}
 
-	if (g_masterlock > 0) {
-		masterpos = (g_masterlock * ti->threadid * 0.61803398875);
-		masterpos = masterpos % g_masterlock;
+	if (g_complex_op > 0) {
+		masterpos = (g_complex_op * ti->threadid * 0.61803398875);
+		masterpos = masterpos % g_complex_op;
 		if (g_verbose >= VERBOSE_NORMAL) {
 			printf("thread %d: masterpos %lu masterlock %lu\n",
-					ti->threadid, masterpos, g_masterlock);
+					ti->threadid, masterpos, g_complex_op);
 		}
 	} else {
 		masterpos = 0;
@@ -403,13 +330,26 @@ unsigned long long ping_pong_do(struct taskinfo *ti)
 	}
 
 	while(g_state == RUNNING) {
-		struct sembuf sop[1];
+		struct sembuf sop[2];
 
 		/* 1) decrease the own semaphore */
-		sop[0].sem_num=sem_own;
-		sop[0].sem_op=-1;
-		sop[0].sem_flg=0;
-		ret = semop(g_svsem_id,sop,1);
+
+		if (g_complex_op > 0 && rounds%g_complex_op == masterpos) {
+			/* complex: decrease and wait for zero */
+			sop[0].sem_num=sem_own;
+			sop[0].sem_op=-1;
+			sop[0].sem_flg=0;
+			sop[1].sem_num=sem_own;
+			sop[1].sem_op=0;
+			sop[1].sem_flg=0;
+			ret = semop(g_svsem_id,sop,2);
+		} else {
+			/* simple: just decrease */
+			sop[0].sem_num=sem_own;
+			sop[0].sem_op=-1;
+			sop[0].sem_flg=0;
+			ret = semop(g_svsem_id,sop,1);
+		}
 		if (ret != 0) {
 			/* EIDRM can happen */
 			if (errno == EIDRM)
@@ -431,10 +371,21 @@ unsigned long long ping_pong_do(struct taskinfo *ti)
 		rounds++;
 
 		/* 2) increase the partner's semaphore */
-		sop[0].sem_num=sem_partner;
-		sop[0].sem_op=1;
-		sop[0].sem_flg=0;
-		ret = semop(g_svsem_id,sop,1);
+		if (g_complex_op > 0 && rounds%g_complex_op == masterpos) {
+			/* complex: wait for zero and then increase*/
+			sop[0].sem_num=sem_partner;
+			sop[0].sem_op=0;
+			sop[0].sem_flg=0;
+			sop[1].sem_num=sem_partner;
+			sop[1].sem_op=1;
+			sop[1].sem_flg=0;
+			ret = semop(g_svsem_id,sop,2);
+		} else {
+			sop[0].sem_num=sem_partner;
+			sop[0].sem_op=1;
+			sop[0].sem_flg=0;
+			ret = semop(g_svsem_id,sop,1);
+		}
 		if (ret != 0) {
 			/* EIDRM can happen */
 			if (errno == EIDRM)
@@ -455,20 +406,6 @@ unsigned long long ping_pong_do(struct taskinfo *ti)
 			do_delay(ti->delay);
 
 		rounds++;
-
-		/*
-		 * lock all semaphores - force a complex operation that is highly likely
-		 * to sleep.
-		 * - only every g_masterlock/2 semaphore operations
-		 * - not all threads at the same time, instead spread based on the golden
-		 *   ratio.
-		 */
-		if (g_masterlock > 0 && (rounds/2)%g_masterlock == masterpos) {
-			if(do_biglock(ti, sem_partner%2, (sem_partner/2)%2))
-				break;
-		}
-
-
 	}
 	return rounds;
 }
@@ -920,9 +857,9 @@ int main(int argc, char **argv)
 				}
 				break;
 			case 'x':
-				g_masterlock = atoi(optarg);
-				if (g_masterlock < 0) {
-					printf(" Invalid masterlock distance specified.\n");
+				g_complex_op = atoi(optarg);
+				if (g_complex_op < 1) {
+					printf(" Invalid complex op distance specified.\n");
 					return 1;
 				}
 				break;
@@ -954,6 +891,9 @@ int main(int argc, char **argv)
 				printf(" 3) posix semaphore ping-pong:\n");
 				printf("    Pairs of threads pass a token to each other. Each token passing forces\n");
 				printf("    a task switch.\n");
+				printf("    Every 'x' semop calls, a complex op is performed. Default no complex ops.\n");
+				printf(" 4) sysvsem mix:\n");
+				printf("    A mixture of single-op and multi-op semop() calls that do not sleep.\n");
 				printf(" First up to <threads per core> threads are put on core 0, then the next\n");
 				printf(" thread(s) are placed to the core <interleave>.\n");
 				printf("\n");
@@ -966,10 +906,9 @@ int main(int argc, char **argv)
 				printf("  -h highest core number that should be used.\n");
 				printf("  -m: Max amount of user space operations (%s).\n", DELAY_ALGORITHM);
 				printf("  -d: Difference between the used semaphores, default 1.\n");
-				printf("  -o 1/2/3: Operation, see above. Default 1.\n");
+				printf("  -o 1/2/3/4: Operation, see above. Default 1.\n");
 				printf("  -f: Force to evaluate all thread values.\n");
-				printf("  -x: complex op distance (only sysvsem ping-pong): perform a complex operation\n");
-				printf("      every <2*complex op distance> normal operations\n");
+				printf("  -x: complex op distance (only sysvsem ping-pong)\n");
 				return 1;
 		}
 	}
